@@ -96,6 +96,19 @@ def owns(app, name, targets, assigned):
     return bool(ids & set(targets)) or ("@other" in targets and not ids & assigned)
 
 
+def program(binary):
+    """'chrome (deleted)' -> 'chrome': an app that updated itself while running reports its old, deleted binary."""
+    return binary.removesuffix(" (deleted)").strip()
+
+
+def tidy(cfg):
+    """Fold app ids saved before program() existed into their real program, so they don't show up twice."""
+    cfg["apps"] = {program(a): n for a, n in cfg.get("apps", {}).items()}
+    for s in [*cfg.get("strips", []), *(s for p in cfg.get("profiles", {}).values() for s in p)]:
+        s["targets"] = list(dict.fromkeys(program(t) for t in s.get("targets", [])))
+    return cfg
+
+
 def die_with_parent():
     ctypes.CDLL("libc.so.6").prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
 
@@ -155,7 +168,7 @@ class Audio:
         streams = {}  # index -> (app, name, vol, muted)
         for s in json.loads(run("pactl", "-f", "json", "list", "sink-inputs", check=True) or "[]"):
             p = s.get("properties", {})
-            app = (p.get("application.process.binary") or p.get("application.name") or "?").lower()
+            app = program(p.get("application.process.binary") or p.get("application.name") or "?").lower()
             vol = max((pct(c["value_percent"]) for c in s.get("volume", {}).values()), default=0)
             streams[s["index"]] = (app, p.get("application.name") or app, vol, s.get("mute", False))
         devs = {}  # default output/input, if there is one (a failed reading is skipped, never taken as 0%)
@@ -389,7 +402,8 @@ class Strip(Gtk.Box):
     def _fill(self, btn):
         if not btn.get_active():
             return
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin=6, spacing=2)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, margin=6, spacing=4)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         running = {a: n for a, n, *_ in self.app.audio.streams.values()}
         names = {**self.app.cfg.get("apps", {}), **running}  # every app that has ever played audio
         for t in self.targets:  # typed names: show once, under the matching app's real name if it has played
@@ -403,15 +417,23 @@ class Strip(Gtk.Box):
                                  active=t in self.targets)
             cb.connect("toggled", self._toggle, t)
             box.add(cb)
-        other = Gtk.Entry(placeholder_text="Other app (e.g. brave)…", margin_top=4)
+        # GTK 3 draws popovers inside the window, so fit the list into the room below this button and let it
+        # scroll (a short list just fits, no scrollbar). 90 px: the "Other app" box, margins and the arrow.
+        below = self.app.get_allocated_height() - self.pick.translate_coordinates(self.app, 0, 0)[1] \
+            - self.pick.get_allocated_height()
+        scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, propagate_natural_height=True,
+                                    propagate_natural_width=True, max_content_height=max(100, below - 90))
+        scroll.add(box)
+        other = Gtk.Entry(placeholder_text="Other app (e.g. brave)…")
         other.set_tooltip_text("Type a program or app name and press Enter, for apps that haven't played audio yet")
         other.connect("activate", self._add_other)
-        box.add(other)
-        box.show_all()
+        outer.pack_start(scroll, True, True, 0)
+        outer.pack_start(other, False, False, 0)  # always visible, below the list
+        outer.show_all()
         old = btn.get_popover().get_child()
         if old:
             old.destroy()
-        btn.get_popover().add(box)
+        btn.get_popover().add(outer)
 
     def _add_other(self, entry):
         t = entry.get_text().strip().lower()
@@ -676,6 +698,7 @@ class App(Gtk.ApplicationWindow):
             self.cfg = None
         self.cfg = self.cfg or {"strips": [{"name": "Master", "targets": ["@master"]}, {"name": "Other", "targets": ["@other"]}]}
         self.cfg.setdefault("profiles", {})
+        tidy(self.cfg)
         self.ignored = set(self.cfg.get("ignored", []))  # knobs whose auto-added channel was removed
         self.osd, self.playing, self.sel_key, self._loading = Osd(), False, None, False
         self.watch_media()
